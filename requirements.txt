@@ -3,3 +3,6 @@ torch
 faiss-cpu
 transformers==3.0.2
 tensorboard
+nltk
+torchmetrics
+wandb
