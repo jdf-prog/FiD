@@ -1,6 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
-# 
+#
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -51,7 +51,8 @@ def init_distributed_mode(params):
         - global_rank
         - world_size
     """
-    params.is_slurm_job = 'SLURM_JOB_ID' in os.environ 
+    print(os.environ) # debug
+    params.is_slurm_job = 'SLURM_JOB_ID' in os.environ
     has_local_rank = hasattr(params, 'local_rank')
 
     # SLURM job
@@ -78,17 +79,24 @@ def init_distributed_mode(params):
         params.n_nodes = int(os.environ['SLURM_JOB_NUM_NODES'])
         params.node_id = int(os.environ['SLURM_NODEID'])
 
-        # local rank on the current node / global rank
-        params.local_rank = int(os.environ['SLURM_LOCALID'])
-        params.global_rank = int(os.environ['SLURM_PROCID'])
-
         # number of processes / GPUs per node
-        params.world_size = int(os.environ['SLURM_NTASKS'])
+        params.local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
+        params.world_size = int(os.environ.get('WORLD_SIZE', 1))
         params.n_gpu_per_node = params.world_size // params.n_nodes
+
+        # local rank on the current node / global rank
+        # params.local_rank = int(os.environ['SLURM_LOCALID'])
+        # params.global_rank = int(os.environ['SLURM_PROCID'])
+        params.local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        params.global_rank = int(os.environ.get('RANK', 0))
+
+
 
         # define master address and master port
         hostnames = subprocess.check_output(['scontrol', 'show', 'hostnames', os.environ['SLURM_JOB_NODELIST']])
+        hostaddr = subprocess.check_output(['getent', 'hosts', hostnames.split()[0]])
         params.main_addr = hostnames.split()[0].decode('utf-8')
+        params.main_addr = "127.0.0.1"
         assert 10001 <= params.main_port <= 20000 or params.world_size == 1
         #print(PREFIX + "Master address: %s" % params.master_addr)
         #print(PREFIX + "Master port   : %i" % params.master_port)
@@ -153,8 +161,10 @@ def init_distributed_mode(params):
         # WORLD_SIZE - required; can be set either here, or in a call to init function
         # RANK - required; can be set either here, or in a call to init function
 
-        #print("Initializing PyTorch distributed ...")
+        print("Initializing PyTorch distributed ...")
+        print(params)
         torch.distributed.init_process_group(
             init_method='env://',
             backend='nccl',
         )
+        print("Done.")

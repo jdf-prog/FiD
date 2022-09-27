@@ -36,29 +36,14 @@ class Dataset(torch.utils.data.Dataset):
             return None
 
     def __getitem__(self, index):
-        example = self.data[index]
-        question = self.question_prefix + " " + example['question']
-        target = self.get_target(example)
-
-        if 'ctxs' in example and self.n_context is not None:
-            f = self.title_prefix + " {} " + self.passage_prefix + " {}"
-            contexts = example['ctxs'][:self.n_context]
-            passages = [f.format(c['title'], c['text']) for c in contexts]
-            scores = [float(c['score']) for c in contexts]
-            scores = torch.tensor(scores)
-            # TODO(egrave): do we want to keep this?
-            if len(contexts) == 0:
-                contexts = [question]
-        else:
-            passages, scores = None, None
 
 
         return {
             'index' : index,
-            'question' : question,
-            'target' : target,
-            'passages' : passages,
-            'scores' : scores
+            'question' : self.question_prefix + " " + self.data[index]['question'],
+            'target' : self.get_target(self.data[index]),
+            'passages' : [(self.title_prefix + " {} " + self.passage_prefix + " {}").format(c['title'], c['text']) for c in self.data[index]['ctxs'][:self.n_context]] if ('ctxs' in self.data[index] and self.n_context is not None) else None,
+            'scores' : torch.tensor([float(c['score']) for c in self.data[index]['ctxs'][:self.n_context]]) if ('ctxs' in self.data[index] and self.n_context is not None) else None,
         }
 
     def sort_data(self):
@@ -111,7 +96,7 @@ class Collator(object):
         def append_question(example):
             if example['passages'] is None:
                 return [example['question']]
-            return [example['question'] + " " + t for t in example['passages']]
+            return [t + " " + example['question'] for t in example['passages']]
         text_passages = [append_question(example) for example in batch]
         passage_ids, passage_masks = encode_passages(text_passages,
                                                      self.tokenizer,

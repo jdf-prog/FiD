@@ -1,6 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # All rights reserved.
-# 
+#
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
@@ -10,7 +10,7 @@ import numpy as np
 from pathlib import Path
 import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
-
+from torchmetrics.text.rouge import ROUGEScore
 
 import src.slurm
 import src.util
@@ -20,13 +20,15 @@ import src.evaluation
 import src.model
 
 def evaluate(model, dataset, dataloader, tokenizer, opt):
+    rouge_score = ROUGEScore(rouge_keys=["rouge2"])
+
     loss, curr_loss = 0.0, 0.0
     model.eval()
     if hasattr(model, "module"):
         model = model.module
     if opt.write_crossattention_scores:
         model.overwrite_forward_crossattention()
-        model.reset_score_storage() 
+        model.reset_score_storage()
     total = 0
     exactmatch = []
     if opt.write_results:
@@ -52,8 +54,9 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
                 ans = tokenizer.decode(o, skip_special_tokens=True)
                 example = dataset.data[idx[k]]
                 if 'answers' in example:
-                    score = src.evaluation.ems(ans, example['answers'])
-                    exactmatch.append(score)
+                    # score = src.evaluation.ems(ans, example['answers'])
+                    score = rouge_score(ans, example['answers'])
+                    exactmatch.append(score['rouge2'].precision)
 
                 if opt.write_results:
                     fw.write(str(example['id']) + "\t" + ans + '\n')
@@ -74,7 +77,7 @@ def evaluate(model, dataset, dataloader, tokenizer, opt):
     if opt.is_distributed:
         torch.distributed.barrier()
     score, total = src.util.weighted_average(np.mean(exactmatch), total, opt)
-    
+
     return score, total
 
 
@@ -98,30 +101,37 @@ if __name__ == "__main__":
     if not directory_exists and opt.is_main:
         options.print_options(opt)
 
+    model_name = opt.model_type + '-' + opt.model_size
+    if opt.model_type == 't5':
+        model_class = src.model.FiDT5
+        tokenizer = transformers.T5Tokenizer.from_pretrained(model_name, return_dict=False)
+    elif opt.model_type == 'bart':
+        model_class = src.model.FiDBART
+        tokenizer = transformers.BartTokenizer.from_pretrained("facebook/" + model_name, return_dict=False)
+    else:
+        raise NotImplementedError
 
-    tokenizer = transformers.T5Tokenizer.from_pretrained('t5-base', return_dict=False)
 
     collator_function = src.data.Collator(opt.text_maxlength, tokenizer)
     eval_examples = src.data.load_data(
-        opt.eval_data, 
+        opt.eval_data,
         global_rank=opt.global_rank, #use the global rank and world size attibutes to split the eval set on multiple gpus
         world_size=opt.world_size
     )
     eval_dataset = src.data.Dataset(
-        eval_examples, 
-        opt.n_context, 
+        eval_examples,
+        opt.n_context,
     )
 
-    eval_sampler = SequentialSampler(eval_dataset) 
+    eval_sampler = SequentialSampler(eval_dataset)
     eval_dataloader = DataLoader(
-        eval_dataset, 
-        sampler=eval_sampler, 
+        eval_dataset,
+        sampler=eval_sampler,
         batch_size=opt.per_gpu_batch_size,
-        num_workers=20, 
+        num_workers=20,
         collate_fn=collator_function
     )
-    
-    model_class = src.model.FiDT5
+
     model = model_class.from_pretrained(opt.model_path)
     model = model.to(opt.device)
 
@@ -133,7 +143,7 @@ if __name__ == "__main__":
     if opt.write_results and opt.is_main:
         glob_path = Path(opt.checkpoint_dir) / opt.name / 'test_results'
         write_path = Path(opt.checkpoint_dir) / opt.name / 'final_output.txt'
-        src.util.write_output(glob_path, write_path) 
+        src.util.write_output(glob_path, write_path)
     if opt.write_crossattention_scores:
         src.util.save_distributed_dataset(eval_dataset.data, opt)
 

@@ -12,6 +12,9 @@ import numpy as np
 from pathlib import Path
 from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, SequentialSampler
 from src.options import Options
+from torchmetrics.text.rouge import ROUGEScore
+import wandb
+import os
 
 import src.slurm
 import src.util
@@ -20,7 +23,7 @@ import src.data
 import src.model
 
 
-def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_em, checkpoint_path):
+def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_rouge, checkpoint_path):
 
     if opt.is_main:
         try:
@@ -30,6 +33,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             logger.warning('Tensorboard is not available.')
 
     torch.manual_seed(opt.global_rank + opt.seed) #different seed for different sampling depending on global_rank
+    torch.manual_seed(3407) # debug
     train_sampler = RandomSampler(train_dataset)
     train_dataloader = DataLoader(
         train_dataset,
@@ -43,6 +47,12 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
     loss, curr_loss = 0.0, 0.0
     epoch = 1
     model.train()
+
+
+    if opt.is_main:
+        wandb.init(project="FID", name=opt.model_type + '-' + opt.model_size + opt.name)
+        wandb.config.update(opt)
+
     while step < opt.total_steps:
         epoch += 1
         for i, batch in enumerate(train_dataloader):
@@ -66,31 +76,39 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
             train_loss = src.util.average_main(train_loss, opt)
             curr_loss += train_loss.item()
 
+            if opt.is_main:
+                wandb.log({"train_loss": train_loss.item()})
+
             if step % opt.eval_freq == 0:
-                dev_em = evaluate(model, eval_dataset, tokenizer, collator, opt)
+                dev_rouge = evaluate(model, eval_dataset, tokenizer, collator, opt)
                 model.train()
                 if opt.is_main:
-                    if dev_em > best_dev_em:
-                        best_dev_em = dev_em
-                        src.util.save(model, optimizer, scheduler, step, best_dev_em,
+                    if dev_rouge > best_dev_rouge:
+                        best_dev_rouge = dev_rouge
+                        src.util.save(model, optimizer, scheduler, step, best_dev_rouge,
                                   opt, checkpoint_path, 'best_dev')
                     log = f"{step} / {opt.total_steps} |"
                     log += f"train: {curr_loss/opt.eval_freq:.3f} |"
-                    log += f"evaluation: {100*dev_em:.2f}EM |"
+                    log += f"evaluation: {100*dev_rouge:.2f}ROUGE2 |"
                     log += f"lr: {scheduler.get_last_lr()[0]:.5f}"
-                    logger.info(log)    
+                    logger.info(log)
                     if tb_logger is not None:
-                        tb_logger.add_scalar("Evaluation", dev_em, step)
+                        tb_logger.add_scalar("Evaluation", dev_rouge, step)
                         tb_logger.add_scalar("Training", curr_loss / (opt.eval_freq), step)
                     curr_loss = 0.
+                    wandb.log({"lr": scheduler.get_last_lr()[0]})
+                    wandb.log({"epoch": epoch})
+
+
 
             if opt.is_main and step % opt.save_freq == 0:
-                src.util.save(model, optimizer, scheduler, step, best_dev_em,
+                src.util.save(model, optimizer, scheduler, step, best_dev_rouge,
                           opt, checkpoint_path, f"step-{step}")
             if step > opt.total_steps:
                 break
 
 def evaluate(model, dataset, tokenizer, collator, opt):
+    rouge_score = ROUGEScore()
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(dataset,
         sampler=sampler,
@@ -101,7 +119,7 @@ def evaluate(model, dataset, tokenizer, collator, opt):
     )
     model.eval()
     total = 0
-    exactmatch = []
+    rouge_scores = []
     model = model.module if hasattr(model, "module") else model
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
@@ -115,13 +133,21 @@ def evaluate(model, dataset, tokenizer, collator, opt):
 
             for k, o in enumerate(outputs):
                 ans = tokenizer.decode(o, skip_special_tokens=True)
-                gold = dataset.get_example(idx[k])['answers']
-                score = src.evaluation.ems(ans, gold)
+                # gold = dataset.get_example(idx[k])['answers']
+                # score = src.evaluation.ems(ans, gold)
+                gold = dataset.get_example(idx[k])['target']
+                score = rouge_score(ans, gold)
+                rouge_scores.append(score)
                 total += 1
-                exactmatch.append(score)
 
-    exactmatch, total = src.util.weighted_average(np.mean(exactmatch), total, opt)
-    return exactmatch
+    rouge1_score = np.mean([r['rouge1_fmeasure'] for r in rouge_scores])
+    rouge2_score = np.mean([r['rouge2_fmeasure'] for r in rouge_scores])
+    rougeL_score = np.mean([r['rougeL_fmeasure'] for r in rouge_scores])
+    if opt.is_main:
+        wandb.log({"rouge1": rouge1_score})
+        wandb.log({"rouge2": rouge2_score})
+        wandb.log({"rougeL": rougeL_score})
+    return rouge2_score
 
 if __name__ == "__main__":
     options = Options()
@@ -149,17 +175,26 @@ if __name__ == "__main__":
         checkpoint_path / 'run.log'
     )
 
-    model_name = 't5-' + opt.model_size
-    model_class = src.model.FiDT5
+    model_name = opt.model_type + '-' + opt.model_size
+    if opt.model_type == 't5':
+        model_class = src.model.FiDT5
+        hf_model_class = transformers.T5ForConditionalGeneration
+        tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
+    elif opt.model_type == 'bart':
+        model_name = "facebook/" + model_name
+        model_class = src.model.FiDBART
+        hf_model_class = transformers.BartForConditionalGeneration
+        tokenizer = transformers.BartTokenizer.from_pretrained(model_name)
+    else:
+        raise NotImplementedError
 
     #load data
-    tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
     collator = src.data.Collator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
 
     # use golbal rank and world size to split the eval set on multiple gpus
     train_examples = src.data.load_data(
-        opt.train_data, 
-        global_rank=opt.global_rank, 
+        opt.train_data,
+        global_rank=opt.global_rank,
         world_size=opt.world_size,
     )
     train_dataset = src.data.Dataset(train_examples, opt.n_context)
@@ -172,19 +207,19 @@ if __name__ == "__main__":
     eval_dataset = src.data.Dataset(eval_examples, opt.n_context)
 
     if not checkpoint_exists and opt.model_path == "none":
-        t5 = transformers.T5ForConditionalGeneration.from_pretrained(model_name)
-        model = src.model.FiDT5(t5.config)
-        model.load_t5(t5.state_dict())
+        hf_model = hf_model_class.from_pretrained(model_name)
+        model = model_class(hf_model.config)
+        model.load_hfm(hf_model.state_dict())
         model = model.to(opt.local_rank)
         optimizer, scheduler = src.util.set_optim(opt, model)
-        step, best_dev_em = 0, 0.0
+        step, best_dev_rouge = 0, 0.0
     elif opt.model_path == "none":
         load_path = checkpoint_path / 'checkpoint' / 'latest'
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = \
+        model, optimizer, scheduler, opt_checkpoint, step, best_dev_rouge = \
             src.util.load(model_class, load_path, opt, reset_params=False)
         logger.info(f"Model loaded from {load_path}")
     else:
-        model, optimizer, scheduler, opt_checkpoint, step, best_dev_em = \
+        model, optimizer, scheduler, opt_checkpoint, step, best_dev_rouge = \
             src.util.load(model_class, opt.model_path, opt, reset_params=True)
         logger.info(f"Model loaded from {opt.model_path}")
 
@@ -208,6 +243,6 @@ if __name__ == "__main__":
         eval_dataset,
         opt,
         collator,
-        best_dev_em,
+        best_dev_rouge,
         checkpoint_path
     )

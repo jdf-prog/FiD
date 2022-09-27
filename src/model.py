@@ -12,6 +12,115 @@ from torch import nn
 from torch.nn import CrossEntropyLoss
 import numpy as np
 
+class FiDBART(transformers.BartForConditionalGeneration):
+    def __init__(self, config):
+        super().__init__(config)
+        self.wrap_encoder()
+
+    def forward_(self, **kwargs):
+        if 'input_ids' in kwargs:
+            kwargs['input_ids'] = kwargs['input_ids'].view(kwargs['input_ids'].size(0), -1)
+        if 'attention_mask' in kwargs:
+            kwargs['attention_mask'] = kwargs['attention_mask'].view(kwargs['attention_mask'].size(0), -1)
+
+        return super(FiDBART, self).forward(
+            **kwargs
+        )
+
+    # We need to resize as B x (N * L) instead of (B * N) x L here
+    # because the BART forward method uses the input tensors to infer
+    # dimensions used in the decoder.
+    # EncoderWrapper resizes the inputs as (B * N) x L.
+    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+        if input_ids != None:
+            # inputs might have already be resized in the generate method
+            if input_ids.dim() == 3:
+                self.model.encoder.n_passages = input_ids.size(1)
+            input_ids = input_ids.view(input_ids.size(0), -1)
+        if attention_mask != None:
+            attention_mask = attention_mask.view(attention_mask.size(0), -1)
+        return super().forward(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            **kwargs
+        )
+
+    # We need to resize the inputs here, as the generate method expect 2D tensors
+    def generate(self, input_ids, attention_mask, max_length):
+        self.model.encoder.n_passages = input_ids.size(1)
+        return super().generate(
+            input_ids=input_ids.view(input_ids.size(0), -1),
+            attention_mask=attention_mask.view(attention_mask.size(0), -1),
+            max_length=max_length
+        )
+
+    def wrap_encoder(self, use_checkpoint=False):
+        """
+        Wrap BART encoder to obtain a Fusion-in-Decoder model.
+        """
+        self.model.encoder = EncoderWrapper(self.model.encoder, use_checkpoint=use_checkpoint)
+
+    def unwrap_encoder(self):
+        """
+        Unwrap Fusion-in-Decoder encoder, useful to load BART weights.
+        """
+        self.model.encoder = self.model.encoder.encoder
+
+    def load_hfm(self, state_dict):
+        """ load huggingface model """
+        self.unwrap_encoder()
+        self.load_state_dict(state_dict)
+        self.wrap_encoder()
+
+    def set_checkpoint(self, use_checkpoint):
+        """
+        Enable or disable checkpointing in the encoder.
+        See https://pytorch.org/docs/stable/checkpoint.html
+        """
+        for mod in self.model.encoder.encoder.layers:
+            mod.use_checkpoint = use_checkpoint
+
+    def reset_score_storage(self):
+        """
+        Reset score storage, only used when cross-attention scores are saved
+        to train a retriever.
+        """
+        for mod in self.decoder.layers:
+            mod.layer[1].EncDecAttention.score_storage = None
+
+    def get_crossattention_scores(self, context_mask):
+        """
+        Cross-attention scores are aggregated to obtain a single scalar per
+        passage. This scalar can be seen as a similarity score between the
+        question and the input passage. It is obtained by averaging the
+        cross-attention scores obtained on the first decoded token over heads,
+        layers, and tokens of the input passage.
+
+        More details in Distilling Knowledge from Reader to Retriever:
+        https://arxiv.org/abs/2012.04584.
+        """
+        scores = []
+        n_passages = context_mask.size(1)
+        for mod in self.decoder.layers:
+            scores.append(mod.layer[1].EncDecAttention.score_storage)
+        scores = torch.cat(scores, dim=2)
+        bsz, n_heads, n_layers, _ = scores.size()
+        # batch_size, n_head, n_layers, n_passages, text_maxlength
+        scores = scores.view(bsz, n_heads, n_layers, n_passages, -1)
+        scores = scores.masked_fill(~context_mask[:, None, None], 0.)
+        scores = scores.sum(dim=[1, 2, 4])
+        ntokens = context_mask.sum(dim=[2]) * n_layers * n_heads
+        scores = scores/ntokens
+        return scores
+
+    def overwrite_forward_crossattention(self):
+        """
+        Replace cross-attention forward function, only used to save
+        cross-attention scores.
+        """
+        for mod in self.decoder.layers:
+            attn = mod.layer[1].EncDecAttention
+            attn.forward = types.MethodType(cross_attention_forward, attn)
 class FiDT5(transformers.T5ForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
@@ -71,7 +180,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         block = nn.ModuleList(block)
         self.encoder.block = block
 
-    def load_t5(self, state_dict):
+    def load_hfm(self, state_dict):
+        """ load huggingface model """
         self.unwrap_encoder()
         self.load_state_dict(state_dict)
         self.wrap_encoder()
@@ -134,7 +244,7 @@ class EncoderWrapper(torch.nn.Module):
         super().__init__()
 
         self.encoder = encoder
-        apply_checkpoint_wrapper(self.encoder, use_checkpoint)
+        # apply_checkpoint_wrapper(self.encoder, use_checkpoint) # debug, do not use checkpint
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs,):
         # total_length = n_passages * passage_length
@@ -143,7 +253,7 @@ class EncoderWrapper(torch.nn.Module):
         input_ids = input_ids.view(bsz*self.n_passages, passage_length)
         attention_mask = attention_mask.view(bsz*self.n_passages, passage_length)
         outputs = self.encoder(input_ids, attention_mask, **kwargs)
-        outputs = (outputs[0].view(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
+        outputs = (outputs[0].reshape(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
         return outputs
 
 class CheckpointWrapper(torch.nn.Module):
