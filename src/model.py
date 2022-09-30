@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn import CrossEntropyLoss
 import numpy as np
-
+from transformers.modeling_bart import _prepare_bart_decoder_inputs
 class FiDBART(transformers.BartForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
@@ -31,7 +31,7 @@ class FiDBART(transformers.BartForConditionalGeneration):
     # because the BART forward method uses the input tensors to infer
     # dimensions used in the decoder.
     # EncoderWrapper resizes the inputs as (B * N) x L.
-    def forward(self, input_ids=None, attention_mask=None, **kwargs):
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
         if input_ids != None:
             # inputs might have already be resized in the generate method
             if input_ids.dim() == 3:
@@ -39,9 +39,19 @@ class FiDBART(transformers.BartForConditionalGeneration):
             input_ids = input_ids.view(input_ids.size(0), -1)
         if attention_mask != None:
             attention_mask = attention_mask.view(attention_mask.size(0), -1)
+
+        model = self.model # self.model is a BartModel
+        # generate decoder input_ids from labels instead of input_ids
+        decoder_input_ids, decoder_attention_mask, _ = _prepare_bart_decoder_inputs(
+            model.config,
+            labels if labels is not None else input_ids,
+        )
         return super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            decoder_input_ids=decoder_input_ids,
+            decoder_attention_mask=decoder_attention_mask,
+            labels=labels,
             **kwargs
         )
 
@@ -160,7 +170,8 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         return super().generate(
             input_ids=input_ids.view(input_ids.size(0), -1),
             attention_mask=attention_mask.view(attention_mask.size(0), -1),
-            max_length=max_length
+            max_length=max_length,
+            min_length=20, # debug
         )
 
     def wrap_encoder(self, use_checkpoint=False):

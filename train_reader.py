@@ -50,7 +50,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
 
 
     if opt.is_main:
-        wandb.init(project="FID", name=opt.model_type + '-' + opt.model_size + opt.name)
+        wandb.init(project="FID", group=opt.model_type + '-' + opt.model_size, name=opt.name)
         wandb.config.update(opt)
 
     while step < opt.total_steps:
@@ -128,7 +128,9 @@ def evaluate(model, dataset, tokenizer, collator, opt):
             outputs = model.generate(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
-                max_length=50
+                max_length=200,
+                num_beams=4,
+                min_length=20
             )
 
             for k, o in enumerate(outputs):

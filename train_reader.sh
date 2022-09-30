@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --time=12:00:00
 #SBATCH --job-name=FID_train
-#SBATCH --nodelist=ink-gary
+#SBATCH --nodelist=ink-titan
 #SBATCH --output ./jobs/%j.out
 #SBATCH --gres=gpu:1
 #SBATCH -n 1
@@ -14,12 +14,12 @@ NGPU=1
 nvidia-smi
 
 model_type='bart'
-model_size="base"
+model_size="large"
 name="basic"
 if [ ${model_type} == 't5' ]; then
         text_maxlength=512
 elif [ ${model_type} == 'bart' ]; then
-        text_maxlength=1024
+        text_maxlength=512
 else
         echo "model type not supported"
         exit 1
@@ -46,7 +46,7 @@ echo "text_maxlength: ${text_maxlength}"
         --scheduler linear \
         --weight_decay 0.01 \
         --per_gpu_batch_size 1 \
-        --n_context 10 \
+        --n_context 3 \
         --total_step 15000 \
         --warmup_step 1000 \
         --main_port 19002 \
