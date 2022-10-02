@@ -40,7 +40,7 @@ def main(args: argparse.Namespace) -> None:
         os.makedirs(os.path.dirname(output_path))
     with open(output_path, 'w') as f:
         for item in transformed_data:
-            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            f.write(json.dumps(item) + "\n")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -1,8 +1,8 @@
 numpy
-torch
 faiss-cpu
 transformers==3.0.2
 tensorboard
 nltk
+rouge_score
 torchmetrics
 wandb

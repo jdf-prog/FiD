@@ -15,6 +15,7 @@ from src.options import Options
 from torchmetrics.text.rouge import ROUGEScore
 import wandb
 import os
+import pprint
 
 import src.slurm
 import src.util
@@ -58,7 +59,6 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
         for i, batch in enumerate(train_dataloader):
             step += 1
             (idx, labels, _, context_ids, context_mask) = batch
-
             train_loss = model(
                 input_ids=context_ids.cuda(),
                 attention_mask=context_mask.cuda(),
@@ -108,7 +108,7 @@ def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, c
                 break
 
 def evaluate(model, dataset, tokenizer, collator, opt):
-    rouge_score = ROUGEScore()
+    rouge_score = ROUGEScore(rouge_keys=("rouge1", "rouge2", "rougeL"), use_stemmer=True)
     sampler = SequentialSampler(dataset)
     dataloader = DataLoader(dataset,
         sampler=sampler,
@@ -179,19 +179,33 @@ if __name__ == "__main__":
 
     model_name = opt.model_type + '-' + opt.model_size
     if opt.model_type == 't5':
+        model_name = "t5-" + opt.model_size
         model_class = src.model.FiDT5
         hf_model_class = transformers.T5ForConditionalGeneration
         tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
+        collator = src.data.Collator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
+    elif opt.model_type == "dualt5":
+        model_name = "t5-" + opt.model_size
+        model_class = src.model.DualFiDT5
+        hf_model_class = transformers.T5ForConditionalGeneration
+        tokenizer = transformers.T5Tokenizer.from_pretrained(model_name)
+        collator = src.data.DualCollator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
     elif opt.model_type == 'bart':
-        model_name = "facebook/" + model_name
+        model_name = "facebook/bart-" + opt.model_size
         model_class = src.model.FiDBART
         hf_model_class = transformers.BartForConditionalGeneration
         tokenizer = transformers.BartTokenizer.from_pretrained(model_name)
+        collator = src.data.Collator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
+    elif opt.model_type == "dualbart":
+        model_name = "facebook/bart-" + opt.model_size
+        model_class = src.model.DualFiDBART
+        hf_model_class = transformers.BartForConditionalGeneration
+        tokenizer = transformers.BartTokenizer.from_pretrained(model_name)
+        collator = src.data.DualCollator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
     else:
         raise NotImplementedError
 
-    #load data
-    collator = src.data.Collator(opt.text_maxlength, tokenizer, answer_maxlength=opt.answer_maxlength)
+
 
     # use golbal rank and world size to split the eval set on multiple gpus
     train_examples = src.data.load_data(
@@ -210,6 +224,7 @@ if __name__ == "__main__":
 
     if not checkpoint_exists and opt.model_path == "none":
         hf_model = hf_model_class.from_pretrained(model_name)
+        hf_model_class.save_pretrained
         model = model_class(hf_model.config)
         model.load_hfm(hf_model.state_dict())
         model = model.to(opt.local_rank)
