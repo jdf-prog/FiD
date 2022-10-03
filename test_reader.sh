@@ -9,20 +9,26 @@
 train_data_path="./data/cnn_dailymail_train_hypo.jsonl"
 dev_data_path="./data/cnn_dailymail_val_hypo.jsonl"
 test_data_path="./data/cnn_dailymail_test_hypo.jsonl"
-model_type='t5'
+model_type='dualbart'
 model_size="large"
-name="titan_try"
+name="basic"
 
 checkpoint_dir="checkpoint/${model_type}-${model_size}"
 model_path="${checkpoint_dir}/${name}/checkpoint/best_dev"
 if [ ${model_type} == 't5' ]; then
         text_maxlength=512
 elif [ ${model_type} == 'bart' ]; then
+        text_maxlength=1024
+elif [ ${model_type} == 'dualt5' ]; then
         text_maxlength=512
+elif [ ${model_type} == 'dualbart' ]; then
+        text_maxlength=1024
+
 else
         echo "model type not supported"
         exit 1
 fi
+
 
 echo "model type: ${model_type}"
 echo "model size: ${model_size}"
@@ -38,7 +44,7 @@ python test_reader.py \
         --model_path ${model_path} \
         --eval_data ${test_data_path} \
         --text_maxlength ${text_maxlength} \
-        --per_gpu_batch_size 3 \
-        --n_context 3 \
+        --per_gpu_batch_size 2 \
+        --n_context 6 \
         --write_results \
-        --main_port 19001 \
+        --main_port 19010 \

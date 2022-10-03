@@ -23,7 +23,7 @@ import src.evaluation
 import src.data
 import src.model
 
-
+torch.set_printoptions(profile="full") # debug
 def train(model, optimizer, scheduler, step, train_dataset, eval_dataset, opt, collator, best_dev_rouge, checkpoint_path):
 
     if opt.is_main:

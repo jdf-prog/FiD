@@ -127,8 +127,6 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError
 
-
-    collator_function = src.data.Collator(opt.text_maxlength, tokenizer)
     eval_examples = src.data.load_data(
         opt.eval_data,
         global_rank=opt.global_rank, #use the global rank and world size attibutes to split the eval set on multiple gpus

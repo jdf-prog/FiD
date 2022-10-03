@@ -18,6 +18,7 @@ class DualFiDBART(transformers.BartForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
         self.wrap_encoder()
+        self.wrap_decoder()
 
     # We need to resize as B x (N * L) instead of (B * N) x L here
     # because the BART forward method uses the input tensors to infer
@@ -72,8 +73,10 @@ class DualFiDBART(transformers.BartForConditionalGeneration):
         """
         encoder1 = self.model.encoder
         encoder2 = copy.deepcopy(encoder1)
-        self.model.encoder = DualEncoderWrapper(encoder1, encoder2)
+        self.model.encoder = DualEncoderWrapper(encoder1, encoder2, self.model.shared.padding_idx)
 
+    def wrap_decoder(self):
+        self.model.decoder = DualBartDecoderWrapper(self.model.decoder)
 
     def unwrap_encoder(self):
         """
@@ -81,11 +84,16 @@ class DualFiDBART(transformers.BartForConditionalGeneration):
         """
         self.model.encoder = self.model.encoder.encoder1
 
+    def unwrap_decoder(self):
+        self.model.decoder = self.model.decoder.decoder
+
     def load_hfm(self, state_dict):
         """ load huggingface model """
         self.unwrap_encoder()
+        self.unwrap_decoder()
         self.load_state_dict(state_dict)
         self.wrap_encoder()
+        self.wrap_decoder()
 
     def set_checkpoint(self, use_checkpoint):
         """
@@ -97,6 +105,7 @@ class DualFiDT5(transformers.T5ForConditionalGeneration):
     def __init__(self, config):
         super().__init__(config)
         self.wrap_encoder()
+        self.wrap_decoder()
 
     def forward_(self, **kwargs):
         if 'input_ids' in kwargs:
@@ -142,7 +151,10 @@ class DualFiDT5(transformers.T5ForConditionalGeneration):
         """
         encoder1 = self.encoder
         encoder2 = copy.deepcopy(encoder1)
-        self.encoder = DualEncoderWrapper(encoder1, encoder2, use_checkpoint=use_checkpoint)
+        self.encoder = DualEncoderWrapper(encoder1, encoder2, self.config.pad_token_id, use_checkpoint, is_t5=True)
+
+    def wrap_decoder(self):
+        self.decoder = DualT5DecoderWrapper(self.decoder)
 
     def unwrap_encoder(self):
         """
@@ -155,18 +167,25 @@ class DualFiDT5(transformers.T5ForConditionalGeneration):
         block = nn.ModuleList(block)
         self.encoder.block = block
 
+    def unwrap_decoder(self):
+        self.decoder = self.decoder.decoder
+
     def load_hfm(self, state_dict):
         """ load huggingface model """
         self.unwrap_encoder()
+        self.unwrap_decoder()
         self.load_state_dict(state_dict)
         self.wrap_encoder()
+        self.wrap_decoder()
 
     def set_checkpoint(self, use_checkpoint):
         """
         Enable or disable checkpointing in the encoder.
         See https://pytorch.org/docs/stable/checkpoint.html
         """
-        for mod in self.encoder.encoder.block:
+        for mod in self.encoder.encoder1.block:
+            mod.use_checkpoint = use_checkpoint
+        for mod in self.encoder.encoder2.block:
             mod.use_checkpoint = use_checkpoint
 
     def reset_score_storage(self):
@@ -277,7 +296,7 @@ class FiDBART(transformers.BartForConditionalGeneration):
         """
         Wrap BART encoder to obtain a Fusion-in-Decoder model.
         """
-        self.model.encoder = EncoderWrapper(self.model.encoder, use_checkpoint=use_checkpoint)
+        self.model.encoder = EncoderWrapper(self.model.encoder, use_checkpoint=False)
 
     def unwrap_encoder(self):
         """
@@ -344,7 +363,7 @@ class FiDT5(transformers.T5ForConditionalGeneration):
         """
         Wrap T5 encoder to obtain a Fusion-in-Decoder model.
         """
-        self.encoder = EncoderWrapper(self.encoder, use_checkpoint=use_checkpoint)
+        self.encoder = EncoderWrapper(self.encoder, use_checkpoint=use_checkpoint, is_t5=True)
 
     def unwrap_encoder(self):
         """
@@ -417,11 +436,12 @@ class EncoderWrapper(torch.nn.Module):
     """
     Encoder Wrapper for Wrapper to obtain a Fusion-in-Decoder model.
     """
-    def __init__(self, encoder, use_checkpoint=False):
+    def __init__(self, encoder, use_checkpoint=False, is_t5=False):
         super().__init__()
 
         self.encoder = encoder
-        # apply_checkpoint_wrapper(self.encoder, use_checkpoint) # debug, do not use checkpint
+        if is_t5:
+            apply_checkpoint_wrapper(self.encoder, use_checkpoint) # debug, do not use checkpint
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs,):
         # total_length = n_passages * passage_length
@@ -437,11 +457,27 @@ class DualEncoderWrapper(torch.nn.Module):
     """
     Encoder Wrapper for Wrapper to obtain a Dual Fusion-in-Decoder model.
     """
-    def __init__(self, encoder1, encoder2):
+    def __init__(self, encoder1, encoder2, padding_idx=0, use_checkpoint=False, is_t5=False):
         super().__init__()
         # duplicate encoder, one for the question, one for the passages
         self.encoder1 = encoder1
         self.encoder2 = encoder2
+        self.padding_idx = padding_idx
+        if is_t5:
+            apply_checkpoint_wrapper(self.encoder1, use_checkpoint) # debug, do not use checkpint
+            apply_checkpoint_wrapper(self.encoder2, use_checkpoint) # debug, do not use checkpint
+
+    def reduce_padding(self, input_ids, attention_mask):
+        """
+            move away the unnecessary padding to save memory
+        """
+        _, passage_length = input_ids.shape
+        padding_mask = input_ids.eq(self.padding_idx)
+        unecessary_padding_mask = torch.prod(padding_mask, dim=0).bool()
+        input_ids = input_ids[:, ~unecessary_padding_mask]
+        attention_mask = attention_mask[:, ~unecessary_padding_mask]
+        reduced_passage_length = input_ids.size(1)
+        return input_ids, attention_mask, reduced_passage_length
 
     def forward(self, input_ids=None, attention_mask=None, **kwargs,):
         # total_length = n_passages * passage_length
@@ -449,25 +485,85 @@ class DualEncoderWrapper(torch.nn.Module):
         passage_length = total_length // self.n_passages
         question_input_ids = input_ids[:, :passage_length]
         question_attention_mask = attention_mask[:, :passage_length]
-        # print(input_ids.shape, attention_mask.shape)
-        # print(question_input_ids.shape, question_attention_mask.shape)
-        # print(input_ids[:, passage_length:].shape, attention_mask[:, passage_length:].shape)
-        # print((bsz*(self.n_passages-1), passage_length))
+
+        # get the corresponding inputs for questions and passages
         passage_input_ids = input_ids[:, passage_length:].reshape(bsz*(self.n_passages-1), passage_length)
         passage_attention_mask = attention_mask[:, passage_length:].reshape(bsz*(self.n_passages-1), passage_length)
+        # reduce the passage padding
+        question_input_ids, question_attention_mask, reduced_passage_length1 = self.reduce_padding(question_input_ids, question_attention_mask)
+        passage_input_ids, passage_attention_mask, reduced_passage_length2 = self.reduce_padding(passage_input_ids, passage_attention_mask)
+        # encoder using difference encoder
         encoder1_outputs = self.encoder1(question_input_ids, question_attention_mask, **kwargs)
         encoder2_outputs = self.encoder2(passage_input_ids, passage_attention_mask, **kwargs)
         # concatenate the 2 outputs
         outputs = tuple()
         # encoder outputs
-        encoder1_output = encoder1_outputs[0].reshape(bsz, 1, -1)
-        encoder2_output = encoder2_outputs[0].reshape(bsz, self.n_passages-1, -1)
+        encoder1_output = encoder1_outputs[0].reshape(bsz, reduced_passage_length1, -1)
+        encoder2_output = encoder2_outputs[0].reshape(bsz, (self.n_passages-1) * reduced_passage_length2, -1)
         outputs += (torch.cat([encoder1_output, encoder2_output], dim=1), )
         # hidden states and attentions
         for i in range(1, len(encoder1_outputs)):
             outputs += ((encoder1_outputs[i], encoder2_outputs[i]), )
-        outputs = (outputs[0].reshape(bsz, self.n_passages*passage_length, -1), ) + outputs[1:]
         return outputs
+
+class DualBartDecoderWrapper(torch.nn.Module):
+    """
+    Decoder Wrapper to assist the DualEncoderWrapper
+    """
+    def __init__(self, decoder):
+        super().__init__()
+        self.decoder = decoder
+
+    def forward(self,
+        input_ids,
+        encoder_hidden_states,
+        encoder_padding_mask,
+        decoder_padding_mask,
+        **kwargs):
+        """
+            adjust the encoder padding mask to fit the padding reduce during the encoding
+        """
+        # After the reduce, no padding existing in the encoder_hidden_states
+        # So the encoder padding mask is all True, i.e. all attending
+        encoder_padding_mask = torch.ones_like(encoder_hidden_states[:, :, 0]).bool()
+        return self.decoder(
+            input_ids,
+            encoder_hidden_states,
+            encoder_padding_mask,
+            decoder_padding_mask,
+            **kwargs
+        )
+
+class DualT5DecoderWrapper(torch.nn.Module):
+    """
+    Decoder Wrapper to assist the DualEncoderWrapper
+    """
+    def __init__(self, decoder):
+        super().__init__()
+        self.decoder = decoder
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        **kwargs):
+        """
+            adjust the encoder padding mask to fit the padding reduce during the encoding
+        """
+        # After the reduce, no padding existing in the encoder_hidden_states
+        # So the encoder padding mask is all True, i.e. all attending
+        encoder_attention_mask = torch.ones_like(encoder_hidden_states[:, :, 0]).bool()
+        return self.decoder(
+            input_ids,
+            attention_mask,
+            encoder_hidden_states,
+            encoder_attention_mask,
+            **kwargs
+        )
+
+
 
 class CheckpointWrapper(torch.nn.Module):
     """

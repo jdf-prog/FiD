@@ -44,9 +44,9 @@ class Dataset(torch.utils.data.Dataset):
 
         return {
             'index' : index,
-            'question' : self.question_prefix + " " + self.data[index]['question'],
+            'question' : self.question_prefix + ": " + self.data[index]['question'],
             'target' : self.get_target(self.data[index]),
-            'passages' : [(self.passage_prefix + " {}").format(c['title'], c['text']) for c in self.data[index]['ctxs'][:self.n_context]] if ('ctxs' in self.data[index] and self.n_context is not None) else None,
+            'passages' : [(self.passage_prefix + ": {}").format(c['text']) for c in self.data[index]['ctxs'][:self.n_context]] if ('ctxs' in self.data[index] and self.n_context is not None) else None,
             'scores' : torch.tensor([float(c['score']) for c in self.data[index]['ctxs'][:self.n_context]]) if ('ctxs' in self.data[index] and self.n_context is not None) else None,
         }
 
@@ -95,7 +95,6 @@ class DualCollator(object):
         target_ids = target["input_ids"]
         target_mask = target["attention_mask"].bool()
         target_ids = target_ids.masked_fill(~target_mask, -100)
-
         text_passages = [[example['question']] + example['passages'] for example in batch]
         passage_ids, passage_masks = encode_passages(text_passages,
                                                      self.tokenizer,

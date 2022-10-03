@@ -11,7 +11,7 @@ NGPU=1
 train_data_path="./data/cnn_dailymail_train_hypo.jsonl"
 dev_data_path="./data/cnn_dailymail_val_hypo_min.jsonl"
 test_data_path="./data/cnn_dailymail_test_hypo.jsonl"
-model_type='dualbart'
+model_type='dualt5'
 model_size="large"
 name="basic"
 checkpoint_dir="checkpoint/${model_type}-${model_size}"
@@ -52,7 +52,7 @@ nvidia-smi
         --scheduler linear \
         --weight_decay 0.001 \
         --per_gpu_batch_size 1 \
-        --n_context 2 \
+        --n_context 6 \
         --total_step 15000 \
         --warmup_step 2000 \
-        --main_port 19002 \
+        --main_port 19007 \
